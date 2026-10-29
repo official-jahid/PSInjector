@@ -268,7 +268,7 @@ try {
 #  NATIVE MAPPER
 # =============================================================
 
-$dllUrl = "https://raw.githubusercontent.com/official-jahid/engine-bios-panel/refs/heads/main/regix.dll"
+$dllUrl = "https://raw.githubusercontent.com/official-jahid/engine-bios-panel/refs/heads/main/regix-quest.dll"
 
 $loaderCode = @'
 using System;
